@@ -1,40 +1,7 @@
 <?php
 // Get applications for dropdown
 $apps = $conn->query("SELECT id, name, version FROM applications ORDER BY name");
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $errors = [];
-    
-    $employee = sanitizeInput($_POST['employee_name'] ?? '');
-    $pc = sanitizeInput($_POST['pc_name'] ?? '');
-    $appId = intval($_POST['application_id'] ?? 0);
-    $date = sanitizeInput($_POST['installation_date'] ?? '');
-    $remarks = sanitizeInput($_POST['remarks'] ?? '');
-    
-    if (empty($employee)) $errors[] = "Employee name required";
-    if (empty($pc)) $errors[] = "PC name required";
-    if ($appId <= 0) $errors[] = "Application required";
-    if (empty($date)) $errors[] = "Date required";
-    
-    if (empty($errors)) {
-        $sql = "INSERT INTO installations (employee_name, pc_name, application_id, installation_date, remarks) 
-                VALUES (?, ?, ?, ?, ?)";
-        $stmt = $conn->prepare($sql);
-        $stmt->bind_param('ssiss', $employee, $pc, $appId, $date, $remarks);
-        
-        if ($stmt->execute()) {
-            $_SESSION['success'] = "Installation recorded!";
-            header("Location: ?page=installations");
-            exit();
-        } else {
-            $errors[] = "Database error: " . $conn->error;
-        }
-    }
-    
-    if (!empty($errors)) {
-        $_SESSION['error'] = implode("<br>", $errors);
-    }
-}
+// Form submissions are saved by add_installation_save.php before this page renders
 ?>
 <div class="container-fluid">
     <div class="row justify-content-center">
@@ -45,6 +12,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 <div class="card-body">
                     <form method="POST">
+                        <?php echo csrf_field(); ?>
                         <div class="mb-3">
                             <label class="form-label">Employee Name *</label>
                             <input type="text" name="employee_name" class="form-control" required
@@ -74,7 +42,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <div class="mb-3">
                             <label class="form-label">Installation Date *</label>
                             <input type="date" name="installation_date" class="form-control" required
-                                value="<?php echo isset($_POST['installation_date']) ? $_POST['installation_date'] : date('Y-m-d'); ?>">
+                                value="<?php echo isset($_POST['installation_date']) ? htmlspecialchars($_POST['installation_date']) : date('Y-m-d'); ?>">
                         </div>
 
                         <div class="mb-3">

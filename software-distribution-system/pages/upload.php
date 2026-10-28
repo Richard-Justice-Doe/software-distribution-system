@@ -21,7 +21,7 @@ function showUploadForm() {
     $allowedExtensions = ['exe', 'msi', 'zip', 'deb', 'rar', 'tar', 'gz', 'bz2', '7z', 'iso', 'dmg'];
     
     // Test network share accessibility
-    $networkShareAccessible = @is_dir('\\\\172.20.1.212\\public\\uploads\\');
+    $networkShareAccessible = @is_dir(NETWORK_SHARE);
     ?>
     <div class="container-fluid">
         <div class="row justify-content-center">
@@ -58,7 +58,7 @@ function showUploadForm() {
                         <?php if (!$networkShareAccessible): ?>
                         <div class="alert alert-warning">
                             <h6><i class="bi bi-exclamation-triangle"></i> Network Share Warning</h6>
-                            <p>The network share <code>\\172.20.1.212\public\uploads\</code> may not be accessible.</p>
+                            <p>The network share <code><?php echo htmlspecialchars(NETWORK_SHARE); ?></code> may not be accessible.</p>
                             <a href="?page=upload&debug=1" class="btn btn-sm btn-outline-warning">Test Connection</a>
                         </div>
                         <?php endif; ?>
@@ -238,7 +238,7 @@ function showUploadForm() {
     const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
     let currentChunk = 0;
     let totalChunks = 0;
-    let fileIdentifier = '';
+    let fileIdentifier = ''; // letters, digits and underscores only - the server rejects anything else
     let retryCount = 0;
     const MAX_RETRIES = 3;
     let uploadStats = {
@@ -369,7 +369,8 @@ function showUploadForm() {
         formData.append('fileSize', file.size);
         formData.append('fileName', file.name);
         formData.append('identifier', fileIdentifier);
-        
+        formData.append('csrf_token', <?php echo json_encode(csrf_token()); ?>);
+
         // Add form data
         formData.append('name', document.getElementById('appName').value);
         formData.append('version', document.getElementById('appVersion').value);
@@ -382,7 +383,8 @@ function showUploadForm() {
         // Create XMLHttpRequest
         const xhr = new XMLHttpRequest();
         
-        xhr.open('POST', 'chunked_upload_handler.php');
+        // Relative to index.php, which renders this page
+        xhr.open('POST', 'pages/chunked_upload_handler.php');
         
         // In the xhr.onload handler, update this section:
 xhr.onload = function() {

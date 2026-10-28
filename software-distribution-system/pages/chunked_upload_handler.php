@@ -1,14 +1,22 @@
 <?php
 // chunked_upload_handler.php - IMPROVED VERSION FOR LARGE FILES
 
+require_once dirname(__DIR__) . '/config.php';
+
 // DISABLE EVERYTHING that might output HTML
 ini_set('display_errors', 0);
 ini_set('display_startup_errors', 0);
 error_reporting(E_ALL);
 
-// Enable detailed logging
+// Enable detailed logging (inside the chunks folder, which the web server won't serve)
+ensure_private_dir(CHUNKS_DIR);
 ini_set('log_errors', 1);
-ini_set('error_log', __DIR__ . '/upload_chunks.log');
+ini_set('error_log', CHUNKS_DIR . 'upload_chunks.log');
+
+// Must match CHUNK_SIZE in pages/upload.php
+define('UPLOAD_CHUNK_SIZE', 5 * 1024 * 1024);
+// Unfinished uploads older than this are removed
+define('STALE_CHUNKS_AGE', 24 * 60 * 60);
 
 // Increase limits for large files
 set_time_limit(0);
@@ -32,6 +40,18 @@ function json_response($success, $message = '', $data = []) {
     exit();
 }
 
+// Only signed-in users may upload, and only from our own upload page
+if (!is_logged_in()) {
+    http_response_code(401);
+    json_response(false, 'Please sign in again');
+}
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !csrf_valid()) {
+    http_response_code(403);
+    json_response(false, 'Your session expired. Reload the page and try again.');
+}
+// Release the session lock so other pages stay usable during a long upload
+session_write_close();
+
 // Log the request
 error_log("=== CHUNKED UPLOAD HANDLER CALLED ===");
 error_log("Time: " . date('Y-m-d H:i:s'));
@@ -42,32 +62,58 @@ try {
     $chunkNumber = (int)($_POST['chunkNumber'] ?? -1);
     $totalChunks = (int)($_POST['totalChunks'] ?? 0);
     $fileSize = (int)($_POST['fileSize'] ?? 0);
-    $fileName = $_POST['fileName'] ?? '';
-    $fileIdentifier = $_POST['identifier'] ?? '';
-    
+    $fileName = basename((string)($_POST['fileName'] ?? ''));
+    $fileIdentifier = (string)($_POST['identifier'] ?? '');
+
     error_log("Chunk info: $chunkNumber/$totalChunks, File: $fileName, Size: " . formatBytes($fileSize));
-    
+
     if (empty($fileName) || empty($fileIdentifier) || $chunkNumber < 0) {
         error_log("ERROR: Missing required parameters");
         json_response(false, 'Missing required parameters');
     }
-    
+
+    // The identifier becomes a folder name, so it must not contain path characters
+    if (!preg_match('/^[A-Za-z0-9_]{1,64}$/', $fileIdentifier)) {
+        error_log("ERROR: Invalid identifier");
+        json_response(false, 'Invalid upload identifier');
+    }
+
+    if (!is_allowed_extension($fileName)) {
+        error_log("ERROR: Disallowed file type: $fileName");
+        json_response(false, 'File type .' . pathinfo($fileName, PATHINFO_EXTENSION) . ' is not allowed');
+    }
+
+    if ($fileSize <= 0 || $fileSize > MAX_FILE_SIZE) {
+        error_log("ERROR: Invalid file size: $fileSize");
+        json_response(false, 'File size must be between 1 byte and ' . formatBytes(MAX_FILE_SIZE));
+    }
+
     // Validate chunk number
-    if ($chunkNumber >= $totalChunks) {
-        error_log("ERROR: Invalid chunk number: $chunkNumber >= $totalChunks");
+    if ($totalChunks !== (int)ceil($fileSize / UPLOAD_CHUNK_SIZE) || $chunkNumber >= $totalChunks) {
+        error_log("ERROR: Invalid chunk number: $chunkNumber of $totalChunks");
         json_response(false, 'Invalid chunk number');
     }
-    
+
+    // Check the application details up front so a large upload doesn't fail at the very end
+    if (trim($_POST['name'] ?? '') === '' || trim($_POST['version'] ?? '') === ''
+        || !in_array($_POST['os'] ?? '', ['Windows', 'Linux', 'macOS', 'Multi-platform'], true)) {
+        json_response(false, 'Missing required application information');
+    }
+
+    if ($chunkNumber === 0) {
+        cleanupStaleChunks();
+    }
+
     // Create chunks directory if it doesn't exist
-    $chunksDir = __DIR__ . '/chunks/' . $fileIdentifier . '/';
+    $chunksDir = CHUNKS_DIR . $fileIdentifier . '/';
     if (!file_exists($chunksDir)) {
-        if (!mkdir($chunksDir, 0777, true)) {
+        if (!mkdir($chunksDir, 0755, true)) {
             error_log("ERROR: Cannot create chunks directory: " . $chunksDir);
             json_response(false, 'Cannot create temporary directory');
         }
         error_log("Created chunks directory: " . $chunksDir);
     }
-    
+
     // If this is NOT the last chunk, just save it
     if ($chunkNumber !== $totalChunks - 1) {
         // Check if file chunk was uploaded
@@ -75,85 +121,85 @@ try {
             error_log("ERROR: No chunk file uploaded for chunk $chunkNumber");
             json_response(false, 'No file chunk received');
         }
-        
+
         $chunkFile = $_FILES['chunk'];
-        
+
         // Check for upload errors
         if ($chunkFile['error'] !== UPLOAD_ERR_OK) {
             $errorMsg = getUploadErrorMessage($chunkFile['error']);
             error_log("ERROR: Chunk $chunkNumber upload error: $errorMsg");
             json_response(false, $errorMsg);
         }
-        
+
         // Validate chunk
         if (!is_uploaded_file($chunkFile['tmp_name'])) {
             error_log("ERROR: Invalid chunk upload for chunk $chunkNumber");
             json_response(false, 'Invalid chunk upload');
         }
-        
+
         // Save chunk with a unique name to prevent overwrites
         $chunkPath = $chunksDir . 'chunk_' . str_pad($chunkNumber, 6, '0', STR_PAD_LEFT);
-        
+
         // Move uploaded file
         if (!move_uploaded_file($chunkFile['tmp_name'], $chunkPath)) {
             $error = error_get_last();
             error_log("ERROR: Failed to save chunk $chunkNumber to: $chunkPath - " . ($error['message'] ?? 'Unknown error'));
             json_response(false, 'Failed to save chunk');
         }
-        
+
         $chunkSize = filesize($chunkPath);
         error_log("Chunk $chunkNumber saved: $chunkPath (" . formatBytes($chunkSize) . ")");
-        
+
         // Count chunks we have so far
         $chunksFound = countChunksInDirectory($chunksDir);
-        
+
         json_response(true, 'Chunk uploaded successfully', [
             'chunkNumber' => $chunkNumber,
             'totalChunks' => $totalChunks,
             'receivedChunks' => $chunksFound,
             'nextChunk' => $chunkNumber + 1
         ]);
-        
+
     } else {
         // THIS IS THE LAST CHUNK - Save it first, then assemble
         error_log("LAST CHUNK received: $chunkNumber/$totalChunks");
-        
+
         // Save the last chunk
         if (isset($_FILES['chunk'])) {
             $chunkFile = $_FILES['chunk'];
-            
+
             if ($chunkFile['error'] !== UPLOAD_ERR_OK) {
                 $errorMsg = getUploadErrorMessage($chunkFile['error']);
                 error_log("ERROR: Last chunk upload error: $errorMsg");
                 json_response(false, $errorMsg);
             }
-            
+
             if (!is_uploaded_file($chunkFile['tmp_name'])) {
                 error_log("ERROR: Invalid last chunk upload");
                 json_response(false, 'Invalid chunk upload');
             }
-            
+
             $chunkPath = $chunksDir . 'chunk_' . str_pad($chunkNumber, 6, '0', STR_PAD_LEFT);
-            
+
             if (!move_uploaded_file($chunkFile['tmp_name'], $chunkPath)) {
                 $error = error_get_last();
                 error_log("ERROR: Failed to save last chunk: " . ($error['message'] ?? 'Unknown error'));
                 json_response(false, 'Failed to save last chunk');
             }
-            
+
             error_log("Last chunk saved: $chunkPath (" . formatBytes(filesize($chunkPath)) . ")");
         }
-        
+
         // Now assemble the file
         error_log("Assembling file from chunks...");
-        
+
         // Check if we have all chunks
         $chunksFound = countChunksInDirectory($chunksDir);
         error_log("Chunks found: $chunksFound, Expected: $totalChunks");
-        
+
         if ($chunksFound !== $totalChunks) {
             error_log("ERROR: Missing chunks. Found: $chunksFound, Expected: $totalChunks");
-            
+
             // List missing chunks
             $missingChunks = [];
             for ($i = 0; $i < $totalChunks; $i++) {
@@ -163,10 +209,10 @@ try {
                 }
             }
             error_log("Missing chunks: " . implode(', ', $missingChunks));
-            
+
             json_response(false, "Missing chunks. Received $chunksFound of $totalChunks chunks");
         }
-        
+
         // Verify chunk sizes before assembly
         error_log("Verifying chunk sizes...");
         $totalSize = 0;
@@ -180,54 +226,52 @@ try {
             $totalSize += $chunkSize;
             error_log("Chunk $i size: " . formatBytes($chunkSize));
         }
-        
+
         error_log("Total chunks size: " . formatBytes($totalSize) . ", Expected: " . formatBytes($fileSize));
-        
+
         if ($totalSize !== $fileSize) {
             error_log("ERROR: Size mismatch. Expected: $fileSize, Actual: $totalSize");
             json_response(false, "File size mismatch. Expected: " . formatBytes($fileSize) . ", Actual: " . formatBytes($totalSize));
         }
-        
+
         // Assemble the file using STREAMING to save memory
         error_log("Starting file assembly using streaming...");
         $assembledFilePath = assembleFileStreaming($chunksDir, $fileName, $totalChunks, $fileSize);
-        
+
         if (!$assembledFilePath) {
             error_log("ERROR: File assembly failed");
             json_response(false, 'Failed to assemble file from chunks');
         }
-        
+
         error_log("File assembled successfully: " . $assembledFilePath . " (" . formatBytes(filesize($assembledFilePath)) . ")");
-        
+
         // Now save to network share and database
         error_log("Processing assembled file...");
         $result = processAssembledFile($assembledFilePath, $fileName, $fileSize, $_POST);
-        
+
+        // Clean up chunks and the assembled temp file whether or not saving worked
+        cleanupChunks($chunksDir);
+        if (file_exists($assembledFilePath)) {
+            unlink($assembledFilePath);
+        }
+
         if ($result['success']) {
-            // Clean up chunks
-            cleanupChunks($chunksDir);
-            
-            // Clean up assembled temp file
-            if (file_exists($assembledFilePath)) {
-                unlink($assembledFilePath);
-            }
-            
             error_log("File processing completed successfully!");
             json_response(true, 'File uploaded successfully to network share', [
                 'fileId' => $result['fileId'],
                 'fileName' => $fileName,
                 'fileSize' => formatBytes($fileSize),
-                'filePath' => $result['finalPath']
+                'storage' => $result['storage']
             ]);
         } else {
             error_log("ERROR: File processing failed: " . $result['message']);
             json_response(false, $result['message']);
         }
     }
-    
-} catch (Exception $e) {
+
+} catch (Throwable $e) {
     error_log("EXCEPTION in upload handler: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
-    json_response(false, 'Server error: ' . $e->getMessage());
+    json_response(false, 'Server error while uploading. Check the upload log for details.');
 }
 
 // ============================================================================
@@ -256,50 +300,66 @@ function formatBytes($bytes, $precision = 2) {
     return round($bytes, $precision) . ' ' . $units[$pow];
 }
 
+function safeFileName($fileName) {
+    return preg_replace('/[^a-zA-Z0-9._-]/', '_', $fileName);
+}
+
 function countChunksInDirectory($dir) {
     if (!file_exists($dir)) {
         return 0;
     }
-    
+
     $count = 0;
     $files = scandir($dir);
-    
+
     foreach ($files as $file) {
         if ($file !== '.' && $file !== '..' && strpos($file, 'chunk_') === 0) {
             $count++;
         }
     }
-    
+
     return $count;
+}
+
+/**
+ * Remove folders left behind by uploads that were abandoned part-way
+ */
+function cleanupStaleChunks() {
+    foreach (glob(CHUNKS_DIR . '*', GLOB_ONLYDIR) ?: [] as $dir) {
+        if (filemtime($dir) < time() - STALE_CHUNKS_AGE) {
+            error_log("Removing stale upload: $dir");
+            cleanupChunks($dir . '/');
+        }
+    }
 }
 
 function assembleFileStreaming($chunksDir, $fileName, $totalChunks, $expectedSize) {
     error_log("Streaming assembly started for $fileName");
-    
+
     // Create a temporary file in system temp directory
     $tempDir = sys_get_temp_dir();
-    $tempFilePath = $tempDir . '/assembled_' . uniqid() . '_' . $fileName;
-    
+    $tempFilePath = $tempDir . '/assembled_' . uniqid() . '_' . safeFileName($fileName);
+
     error_log("Creating temp file: $tempFilePath");
-    
+
     // Open temp file for writing
     $tempFile = fopen($tempFilePath, 'wb');
     if (!$tempFile) {
         error_log("ERROR: Cannot open temp file for writing: $tempFilePath");
         return false;
     }
-    
+
     // Process chunks in order
     for ($i = 0; $i < $totalChunks; $i++) {
         $chunkPath = $chunksDir . 'chunk_' . str_pad($i, 6, '0', STR_PAD_LEFT);
-        
+
         if (!file_exists($chunkPath)) {
             error_log("ERROR: Missing chunk $i at $chunkPath");
             fclose($tempFile);
             unlink($tempFilePath);
             return false;
         }
-        
+
         // Open chunk file
         $chunkFile = fopen($chunkPath, 'rb');
         if (!$chunkFile) {
@@ -308,26 +368,26 @@ function assembleFileStreaming($chunksDir, $fileName, $totalChunks, $expectedSiz
             unlink($tempFilePath);
             return false;
         }
-        
+
         // Stream chunk content to temp file
         while (!feof($chunkFile)) {
             $buffer = fread($chunkFile, 8192); // 8KB chunks for streaming
             fwrite($tempFile, $buffer);
         }
-        
+
         fclose($chunkFile);
-        
+
         // Delete chunk immediately to save space
         unlink($chunkPath);
-        
+
         // Log progress every 25 chunks
         if ($i % 25 === 0 || $i === $totalChunks - 1) {
             error_log("Assembly progress: " . ($i + 1) . "/$totalChunks chunks processed");
         }
     }
-    
+
     fclose($tempFile);
-    
+
     // Verify final file size
     $actualSize = filesize($tempFilePath);
     if ($actualSize !== $expectedSize) {
@@ -335,7 +395,7 @@ function assembleFileStreaming($chunksDir, $fileName, $totalChunks, $expectedSiz
         unlink($tempFilePath);
         return false;
     }
-    
+
     error_log("File assembly completed successfully: $tempFilePath (" . formatBytes($actualSize) . ")");
     return $tempFilePath;
 }
@@ -344,7 +404,7 @@ function cleanupChunks($chunksDir) {
     if (!file_exists($chunksDir)) {
         return;
     }
-    
+
     $files = scandir($chunksDir);
     foreach ($files as $file) {
         if ($file !== '.' && $file !== '..') {
@@ -354,50 +414,44 @@ function cleanupChunks($chunksDir) {
             }
         }
     }
-    
+
     rmdir($chunksDir);
     error_log("Cleaned up chunks directory: $chunksDir");
 }
 
 function processAssembledFile($tempFilePath, $originalFileName, $fileSize, $formData) {
     error_log("Processing assembled file: $tempFilePath");
-    
-    // Database configuration
-    $db_host = 'localhost';
-    $db_user = 'root';
-    $db_pass = '';
-    $db_name = 'software_distribution';
-    
+
     // Create database connection
-    $conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-    if ($conn->connect_error) {
-        error_log("ERROR: Database connection failed: " . $conn->connect_error);
+    $conn = db_connect();
+    if (!$conn) {
         return ['success' => false, 'message' => 'Database connection failed'];
     }
-    $conn->set_charset("utf8mb4");
-    
+
     // Network share path
-    $networkShare = '\\\\172.20.1.212\\public\\uploads\\';
-    
+    $networkShare = NETWORK_SHARE;
+    $storage = 'Network Share';
+
     // Check network share
     if (!@is_dir($networkShare)) {
         error_log("ERROR: Network share not accessible: $networkShare");
-        
-        // Try to create local backup directory
-        $localBackup = __DIR__ . '/uploads_backup/';
-        if (!file_exists($localBackup)) {
-            mkdir($localBackup, 0777, true);
+
+        // Fall back to the local uploads folder, which the web server won't serve
+        if (!ensure_private_dir(LOCAL_UPLOADS)) {
+            $conn->close();
+            return ['success' => false, 'message' => 'Network share is not accessible and no local fallback is available'];
         }
-        $networkShare = $localBackup;
+        $networkShare = LOCAL_UPLOADS;
+        $storage = 'Local backup';
         error_log("Using local backup: $networkShare");
     }
-    
+
     // Generate unique filename
-    $uniqueName = uniqid('app_', true) . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $originalFileName);
+    $uniqueName = uniqid('app_', true) . '_' . safeFileName($originalFileName);
     $finalPath = $networkShare . $uniqueName;
-    
+
     error_log("Copying to: $finalPath");
-    
+
     // Copy using chunked copy for large files
     if (!copyFileChunked($tempFilePath, $finalPath)) {
         $error = error_get_last();
@@ -405,7 +459,7 @@ function processAssembledFile($tempFilePath, $originalFileName, $fileSize, $form
         $conn->close();
         return ['success' => false, 'message' => 'Failed to save file to destination'];
     }
-    
+
     // Verify copy
     if (!file_exists($finalPath) || filesize($finalPath) !== $fileSize) {
         error_log("ERROR: File verification failed. Expected: $fileSize, Actual: " . (file_exists($finalPath) ? filesize($finalPath) : 'File missing'));
@@ -415,30 +469,21 @@ function processAssembledFile($tempFilePath, $originalFileName, $fileSize, $form
         $conn->close();
         return ['success' => false, 'message' => 'File verification failed'];
     }
-    
+
     error_log("File copied successfully to: $finalPath");
-    
-    // Get form data
+
+    // Get form data (already validated when the upload started)
     $name = trim($formData['name'] ?? '');
     $version = trim($formData['version'] ?? '');
     $os = trim($formData['os'] ?? '');
     $description = trim($formData['description'] ?? '');
-    
-    // Validate required fields
-    if (empty($name) || empty($version) || empty($os)) {
-        if (file_exists($finalPath)) {
-            unlink($finalPath);
-        }
-        $conn->close();
-        return ['success' => false, 'message' => 'Missing required application information'];
-    }
-    
+
     // Save to database
     $fileSizeFormatted = formatBytes($fileSize);
-    $sql = "INSERT INTO applications (name, version, operating_system, description, 
-            file_name, original_file_name, file_path, file_size) 
+    $sql = "INSERT INTO applications (name, version, operating_system, description,
+            file_name, original_file_name, file_path, file_size)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-    
+
     $stmt = $conn->prepare($sql);
     if (!$stmt) {
         error_log("ERROR: Database prepare failed: " . $conn->error);
@@ -446,12 +491,12 @@ function processAssembledFile($tempFilePath, $originalFileName, $fileSize, $form
             unlink($finalPath);
         }
         $conn->close();
-        return ['success' => false, 'message' => 'Database error: ' . $conn->error];
+        return ['success' => false, 'message' => 'Database error while saving the application'];
     }
-    
+
     $stmt->bind_param('ssssssss', $name, $version, $os, $description,
         $uniqueName, $originalFileName, $finalPath, $fileSizeFormatted);
-    
+
     if (!$stmt->execute()) {
         error_log("ERROR: Database execute failed: " . $stmt->error);
         if (file_exists($finalPath)) {
@@ -459,19 +504,19 @@ function processAssembledFile($tempFilePath, $originalFileName, $fileSize, $form
         }
         $stmt->close();
         $conn->close();
-        return ['success' => false, 'message' => 'Database save error: ' . $stmt->error];
+        return ['success' => false, 'message' => 'Database error while saving the application'];
     }
-    
+
     $fileId = $stmt->insert_id;
     $stmt->close();
     $conn->close();
-    
+
     error_log("File saved to database successfully. ID: $fileId");
-    
+
     return [
         'success' => true,
         'fileId' => $fileId,
-        'finalPath' => $finalPath,
+        'storage' => $storage,
         'message' => 'File processed successfully'
     ];
 }
@@ -479,26 +524,26 @@ function processAssembledFile($tempFilePath, $originalFileName, $fileSize, $form
 function copyFileChunked($source, $destination) {
     // For large files, copy in chunks
     $chunkSize = 10 * 1024 * 1024; // 10MB chunks
-    
+
     $sourceHandle = fopen($source, 'rb');
     if (!$sourceHandle) {
         return false;
     }
-    
+
     $destHandle = fopen($destination, 'wb');
     if (!$destHandle) {
         fclose($sourceHandle);
         return false;
     }
-    
+
     while (!feof($sourceHandle)) {
         $chunk = fread($sourceHandle, $chunkSize);
         fwrite($destHandle, $chunk);
     }
-    
+
     fclose($sourceHandle);
     fclose($destHandle);
-    
+
     return true;
 }
 ?>

@@ -143,6 +143,7 @@ $totalPages = ceil($total / $perPage);
                                     </a>
                                     <form action="?page=delete" method="POST" class="d-inline"
                                         onsubmit="return confirm('Are you sure you want to delete this application?')">
+                                        <?php echo csrf_field(); ?>
                                         <input type="hidden" name="id" value="<?php echo $app['id']; ?>">
                                         <button type="submit" class="btn btn-sm btn-danger" title="Delete">
                                             <i class="bi bi-trash"></i>
@@ -163,7 +164,7 @@ $totalPages = ceil($total / $perPage);
                     <?php if ($page > 1): ?>
                     <li class="page-item">
                         <a class="page-link"
-                            href="?page=applications&search=<?php echo urlencode($search); ?>&os=<?php echo $os; ?>&p=<?php echo $page - 1; ?>">
+                            href="?page=applications&search=<?php echo urlencode($search); ?>&os=<?php echo urlencode($os); ?>&p=<?php echo $page - 1; ?>">
                             Previous
                         </a>
                     </li>
@@ -177,7 +178,7 @@ $totalPages = ceil($total / $perPage);
                     ?>
                     <li class="page-item <?php echo $i == $page ? 'active' : ''; ?>">
                         <a class="page-link"
-                            href="?page=applications&search=<?php echo urlencode($search); ?>&os=<?php echo $os; ?>&p=<?php echo $i; ?>">
+                            href="?page=applications&search=<?php echo urlencode($search); ?>&os=<?php echo urlencode($os); ?>&p=<?php echo $i; ?>">
                             <?php echo $i; ?>
                         </a>
                     </li>
@@ -186,7 +187,7 @@ $totalPages = ceil($total / $perPage);
                     <?php if ($page < $totalPages): ?>
                     <li class="page-item">
                         <a class="page-link"
-                            href="?page=applications&search=<?php echo urlencode($search); ?>&os=<?php echo $os; ?>&p=<?php echo $page + 1; ?>">
+                            href="?page=applications&search=<?php echo urlencode($search); ?>&os=<?php echo urlencode($os); ?>&p=<?php echo $page + 1; ?>">
                             Next
                         </a>
                     </li>

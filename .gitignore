@@ -1,0 +1,7 @@
+# Uploaded installers, in-progress chunks and upload logs are runtime data
+software-distribution-system/uploads/
+software-distribution-system/uploads_backup/
+software-distribution-system/chunks/
+software-distribution-system/pages/chunks/
+software-distribution-system/pages/uploads_backup/
+*.log

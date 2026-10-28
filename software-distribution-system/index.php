@@ -1,9 +1,5 @@
 <?php
-session_start();
-
-// Enable error reporting for debugging
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
+require_once __DIR__ . '/config.php';
 
 // Define parseSizeToBytes function FIRST
 if (!function_exists('parseSizeToBytes')) {
@@ -50,14 +46,10 @@ error_log("Effective upload limit: " . formatBytes($actualLimit));
 @ini_set('max_execution_time', '3600');
 @ini_set('max_input_time', '3600');
 
-// Define constants for network storage
+// Define constants for network storage (share paths, size and type limits live in config.php)
 define('SITE_URL', 'http://' . $_SERVER['HTTP_HOST'] . dirname($_SERVER['PHP_SELF']));
-define('NETWORK_SHARE', '\\\\172.20.1.212\\public\\uploads\\');
-define('NETWORK_SHARE_MAPPED', 'Z:\\uploads\\'); // Backup if mapped drive works
 define('LOCAL_TEMP_PATH', sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'software_upload_temp' . DIRECTORY_SEPARATOR);
-define('MAX_FILE_SIZE', 25 * 1024 * 1024 * 1024); // 25GB in bytes
-define('CHUNK_SIZE', 20 * 1024 * 1024); // 20MB chunk size for processing
-define('ALLOWED_EXTENSIONS', ['exe', 'msi', 'zip', 'deb', 'rar', 'tar', 'gz', 'bz2', '7z', 'iso', 'dmg']);
+define('CHUNK_SIZE', 5 * 1024 * 1024); // 5MB, matches the chunk size the upload page sends
 
 // Add these constants for chunked uploads
 define('MAX_RETRIES', 3);
@@ -81,28 +73,16 @@ define('ALLOWED_MIME_TYPES', array(
     'application/octet-stream'       // fallback for binary files
 ));
 
-// Database configuration
-$db_host = 'localhost';
-$db_user = 'root';
-$db_pass = '';
-$db_name = 'software_distribution';
-
-// Create database connection
-try {
-    $conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-    if ($conn->connect_error) {
-        // Try to create database if it doesn't exist
-        $conn = new mysqli($db_host, $db_user, $db_pass);
-        if ($conn->connect_error) {
-            die("Connection failed: " . $conn->connect_error);
-        }
-        // Redirect to install
-        header("Location: install.php");
-        exit();
-    }
-    $conn->set_charset("utf8mb4");
-} catch (Exception $e) {
+// Create database connection (credentials are in config.php)
+$conn = db_connect();
+if (!$conn) {
     header("Location: install.php");
+    exit();
+}
+
+// Everything below requires a signed-in user
+if (!is_logged_in()) {
+    header("Location: login.php");
     exit();
 }
 
@@ -116,8 +96,9 @@ function formatBytes($bytes, $precision = 2) {
     return round($bytes, $precision) . ' ' . $units[$pow];
 }
 
+// Values are stored as typed; pages escape them with htmlspecialchars when displaying
 function sanitizeInput($data) {
-    return htmlspecialchars(stripslashes(trim($data)), ENT_QUOTES, 'UTF-8');
+    return trim((string)$data);
 }
 
 // Function to test network share access
@@ -370,12 +351,24 @@ if (!@is_dir(NETWORK_SHARE)) {
 }
 
 // Check if chunks directory exists for resumable uploads
-$chunksDir = __DIR__ . '/chunks/';
-if (!file_exists($chunksDir) && $page == 'upload') {
-    if (@mkdir($chunksDir, 0777, true)) {
-        file_put_contents($chunksDir . '.htaccess', 'Deny from all');
-        error_log("INFO: Created chunks directory for resumable uploads");
-    }
+if ($page == 'upload' && !ensure_private_dir(CHUNKS_DIR)) {
+    error_log("WARNING: Cannot create chunks directory: " . CHUNKS_DIR);
+}
+
+// Every form submission must carry this session's CSRF token
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !csrf_valid()) {
+    $_SESSION['error'] = "Your session expired. Please try again.";
+    header("Location: ?page=" . urlencode($page));
+    exit();
+}
+
+// Actions that send headers (file download, redirects) must run before any HTML is output
+if ($page === 'download') {
+    include 'pages/download.php';
+} elseif ($page === 'delete') {
+    include 'pages/delete.php';
+} elseif ($page === 'add-installation' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    include 'pages/add_installation_save.php';
 }
 
 ?>
@@ -475,6 +468,10 @@ if (!file_exists($chunksDir) && $page == 'upload') {
                         <a href="?page=upload&debug=1" class="mt-4 text-warning">
                             <i class="bi bi-bug"></i> Test Network Access
                         </a>
+                        <hr class="text-white">
+                        <a href="login.php?logout=1">
+                            <i class="bi bi-box-arrow-right"></i> Sign Out (<?php echo htmlspecialchars($_SESSION['username']); ?>)
+                        </a>
                     </nav>
                 </div>
             </div>
@@ -527,12 +524,6 @@ if (!file_exists($chunksDir) && $page == 'upload') {
                     case 'add-installation':
                         include 'pages/add_installation.php';
                         break;
-                    case 'download':
-                        include 'pages/download.php';
-                        break;
-                    case 'delete':
-                        include 'pages/delete.php';
-                        break;
                     default:
                         include 'pages/dashboard.php';
                 }
@@ -541,20 +532,7 @@ if (!file_exists($chunksDir) && $page == 'upload') {
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/resumablejs@1.1.0/resumable.min.js"></script>
-    <script>
-    // Cleanup function for old chunks
-    function cleanupOldChunks() {
-        fetch('cleanup_chunks.php')
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    console.log('Chunk cleanup completed');
-                }
-            });
-    }
-
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>    <script>
     // Auto-dismiss alerts after 5 seconds
     setTimeout(() => {
         document.querySelectorAll('.alert').forEach(alert => {
@@ -574,11 +552,6 @@ if (!file_exists($chunksDir) && $page == 'upload') {
             alert('File size exceeds the maximum limit of <?php echo formatBytes(MAX_FILE_SIZE); ?>');
             this.value = ''; // Clear the file input
         }
-    });
-
-    // Run cleanup on page load
-    document.addEventListener('DOMContentLoaded', function() {
-        cleanupOldChunks();
     });
     </script>
 </body>
